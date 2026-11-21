@@ -124,7 +124,7 @@ func TestThePackageUsesTheGeneratedConcreteModel(t *testing.T) {
 			"type DiffusionCollection []*Diffusion",
 		},
 		"service.go": {
-			"db     *data.DB",
+			"db          *data.DB",
 			"func NewDiffusionService(db *data.DB) *DiffusionService",
 			"Diffusions(s.db).New()",
 			"Diffusions(s.db).WhereKey(",

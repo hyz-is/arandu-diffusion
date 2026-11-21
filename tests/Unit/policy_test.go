@@ -35,8 +35,6 @@ var everyAction = []security.Action{
 	diffusion.DiffusionView,
 	diffusion.DiffusionList,
 	diffusion.DiffusionCreate,
-	diffusion.DiffusionUpdate,
-	diffusion.DiffusionDelete,
 }
 
 // administrator is the most privileged subject an application can produce. It
@@ -65,7 +63,7 @@ func TestThePolicyDeniesEveryActionByDefault(t *testing.T) {
 func TestThePolicyDeniesARecordOfAnotherTenant(t *testing.T) {
 	t.Parallel()
 
-	other := diffusion.Diffusion{ID: "record-1", TenantID: "globex", Name: "theirs"}
+	other := diffusion.Diffusion{ID: "record-1", TenantID: "globex", UserID: "stranger"}
 
 	err := diffusion.DiffusionPolicy{}.Can(context.Background(),
 		administrator(), diffusion.DiffusionView, other)
@@ -127,8 +125,9 @@ func TestTheServiceRefusesBeforeReachingTheModel(t *testing.T) {
 	if _, err := service.List(ctx, administrator(), data.Query{}); !errors.Is(err, security.ErrForbidden) {
 		t.Fatalf("List reached the Model before the policy refusal: %v", err)
 	}
-	if _, err := service.Create(ctx, administrator(), diffusion.CreateRequest{Name: "one"}); !errors.Is(err, security.ErrForbidden) {
-		t.Fatalf("Create reached the Model before the policy refusal: %v", err)
+	failed := diffusion.Run{Request: diffusion.Request{Prompt: "one"}, Err: errors.New("no model")}
+	if _, err := service.Record(ctx, administrator(), failed); !errors.Is(err, security.ErrForbidden) {
+		t.Fatalf("Record reached the Model before the policy refusal: %v", err)
 	}
 }
 
@@ -281,17 +280,21 @@ func TestTheTenantComesFromTheGrant(t *testing.T) {
 	}
 }
 
-func TestTheRequestValidatesItsInput(t *testing.T) {
+func TestARunHasAResultOrAnError(t *testing.T) {
 	t.Parallel()
 
-	if errs := (diffusion.CreateRequest{}).Validate(); !errs.Any() {
-		t.Fatal("an empty request validated")
+	if errs := (diffusion.Run{}).Validate(); !errs.Any() {
+		t.Fatal("an empty run validated")
 	}
-	if errs := (diffusion.CreateRequest{Name: strings.Repeat("a", 121)}).Validate(); !errs.Any() {
-		t.Fatal("a name past the maximum validated")
+	both := diffusion.Run{Result: &diffusion.Result{}, Err: errors.New("x")}
+	if errs := both.Validate(); !errs.Any() {
+		t.Fatal("a run with a result and an error validated")
 	}
-	if errs := (diffusion.CreateRequest{Name: "one"}).Validate(); errs.Any() {
-		t.Fatalf("a valid request was rejected: %v", errs)
+	if errs := (diffusion.Run{Result: &diffusion.Result{}}).Validate(); errs.Any() {
+		t.Fatalf("a finished run was rejected: %v", errs)
+	}
+	if errs := (diffusion.Run{Err: errors.New("x")}).Validate(); errs.Any() {
+		t.Fatalf("a failed run was rejected: %v", errs)
 	}
 }
 

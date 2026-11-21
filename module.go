@@ -1,16 +1,32 @@
-// Package diffusion is an Arandu module: one entity with its generated query, one
-// policy that decides about it, one service that orchestrates each use case, and
-// the routes that reach them.
+// Package diffusion is an Arandu module that is also an image engine: it links
+// stable-diffusion.cpp through cgo, so the model runs inside the process rather
+// than behind an HTTP call, and it keeps what each run cost.
 //
-// The files are laid out by role rather than by layer, so the whole package
-// reads top to bottom:
+// There are two halves, and either works without the other.
 //
+// The engine is a library. Load turns a ModelSet -- a diffusion GGUF, its text
+// encoder, its VAE and optional LoRAs -- into an Engine, and Engine.Generate
+// does txt2img, img2img, inpainting under a mask that leaves the kept pixels
+// identical, and reference-image editing, answering PNG bytes and the Metrics of
+// the run. Fake is the same contract with no model, for an application's tests.
+// The real engine exists only under the `sdcpp` build tag; without it the whole
+// package compiles anywhere.
+//
+// The module is the Arandu half: one entity, Diffusion, which is one run kept;
+// one policy that decides about it; one service that owns its Model-first data
+// path; and the routes that reach them. The files are laid out by role rather
+// than by layer, so the package reads top to bottom:
+//
+//	engine.go      -> the Engine contract, ModelSet, Request, Result, Metrics
+//	engine_sdcpp.go-> the cgo engine (build tag sdcpp); engine_stub.go without it
+//	fake.go        -> the scripted Engine for tests
+//	imaging.go     -> decoding, masks, the composite that keeps masked pixels
+//	modelfile.go   -> digests and the quantization read from a GGUF header
 //	module.go      -> registration, routes, handlers and migrations
 //	config.go      -> what the application passes in
 //	model.go       -> the entity, and what it may answer with
 //	policy.go      -> who may do what
 //	service.go     -> the use cases, and Model access after authorization
-//	views.go       -> the files the application takes ownership of
 //
 // An application registers it explicitly. There is no service provider, no
 // container and no discovery: the wiring is lines somebody wrote, and
@@ -20,18 +36,17 @@ package diffusion
 import (
 	"context"
 	"errors"
-	"fmt"
 	stdhttp "net/http"
-	"strings"
+	"strconv"
 
 	"github.com/arandu-io/framework/data"
 	"github.com/arandu-io/framework/foundation"
 	fhttp "github.com/arandu-io/framework/http"
 	"github.com/arandu-io/framework/http/middleware"
 	"github.com/arandu-io/framework/security"
+	"github.com/arandu-io/framework/validation"
 	"github.com/arandu-io/hesape/database/migrations"
 	"github.com/arandu-io/hesape/database/schema"
-	"github.com/arandu-io/hesape/view"
 )
 
 // Module is what the application registers.
@@ -39,14 +54,13 @@ import (
 // It implements foundation.Module, which is Name and Routes and nothing else --
 // that pair is the whole public contract between a package and the framework.
 //
-// It also implements foundation.Migratable, because it owns a table,
-// foundation.Publishable, because it hands view sources to the project, and
-// foundation.Bootable, because it refuses to start while those views are not
-// linked. The other optional interfaces are declared beside Module in the
-// framework and are opted into the same way, by implementing them: Background
-// to run a loop of its own, Schedulable to declare work for the scheduler,
-// Health to report on the storage it depends on, Closable to give resources
-// back at shutdown.
+// It also implements foundation.Migratable, because it owns a table. The other
+// optional interfaces are declared beside Module in the framework and are opted
+// into the same way, by implementing them: Bootable to prepare state at boot,
+// Background to run a loop of its own, Schedulable to declare work for the
+// scheduler, Health to report on the storage it depends on, Closable to give
+// resources back at shutdown. It implements none of them: the engine it uses is
+// the application's, and the application closes it.
 type Module struct {
 	cfg      Config
 	svc      *DiffusionService
@@ -55,10 +69,8 @@ type Module struct {
 
 // Compile-time proof that the module honors the contracts it claims.
 var (
-	_ foundation.Module      = (*Module)(nil)
-	_ foundation.Migratable  = (*Module)(nil)
-	_ foundation.Bootable    = (*Module)(nil)
-	_ foundation.Publishable = (*Module)(nil)
+	_ foundation.Module     = (*Module)(nil)
+	_ foundation.Migratable = (*Module)(nil)
 )
 
 // New returns the module, or the reason it cannot be built.
@@ -81,11 +93,37 @@ func New(cfg Config, db *data.DB, sessions *security.SessionStore) (*Module, err
 		return nil, errors.New("diffusion: New needs a session store: every route is mounted behind RequireAuth, which reads it to admit a request and to put who is asking on it")
 	}
 	cfg = cfg.withDefaults()
+	service := NewDiffusionService(db)
+	service.engine = cfg.Engine
+	service.keepPrompts = cfg.KeepPrompts
+	if cfg.Policy != nil {
+		// The one place the shipped policy is replaced, and it is a field of the
+		// configuration the application already writes rather than a setter: a
+		// service whose rules can be swapped after it has answered a request is
+		// a service whose rules nobody can state.
+		service.policy = cfg.Policy
+	}
 	return &Module{
 		cfg:      cfg,
-		svc:      NewDiffusionService(db),
+		svc:      service,
 		sessions: sessions,
 	}, nil
+}
+
+// Generate runs the engine for one subject and keeps the run. It is what an
+// application calls from its own handler or job, where the images come from its
+// own storage: the routes of this package only serve text-to-image.
+//
+// The policy is asked for DiffusionCreate before any compute is spent. See
+// DiffusionService.Generate for what is kept.
+func (m *Module) Generate(ctx context.Context, who security.Subject, req Request) (*Result, *Diffusion, error) {
+	return m.svc.Generate(ctx, who, req)
+}
+
+// Record keeps a run the application made with the Engine itself, asking the
+// same policy for the same action as Generate.
+func (m *Module) Record(ctx context.Context, who security.Subject, run Run) (*Diffusion, error) {
+	return m.svc.Record(ctx, who, run)
 }
 
 // Name is the module identifier: a lowercase slug, stable, no spaces.
@@ -111,71 +149,12 @@ func (m *Module) Routes(r *fhttp.Router) {
 
 	r.Action(stdhttp.MethodGet, m.cfg.Prefix, m.index).Name("diffusion.index")
 	r.Action(stdhttp.MethodGet, m.cfg.Prefix+"/{id}", m.show).Name("diffusion.show")
-	r.Action(stdhttp.MethodPost, m.cfg.Prefix, m.store).Name("diffusion.store")
-}
-
-// PublishCommand is what an application runs to take ownership of the views
-// this package offers.
-//
-// It is spelled out as a constant so that whatever says it -- the refusal
-// below, or a message an application writes for its own operators -- says one
-// thing. A person who is told two different commands for one job tries both.
-//
-// The command reads the modules the application registered and writes what each
-// one declares, which is why it is the application's command and not this
-// package's: nothing outside the application knows which modules it holds.
-const PublishCommand = "aru vendor:publish --apply"
-
-// Boot refuses to serve when a view this package renders is not in the binary.
-//
-// A compiled view registers itself from init(), so by the time anything boots
-// the question has one answer already: either the application published the
-// files, compiled them and imported the package they became, or it did not.
-// Asking here turns "did anybody run the install command" into one refusal at
-// start-up that names the views and the command, instead of a 500 on the first
-// request that reached one of them -- which is where it used to be answered,
-// once per page, to whoever happened to open it.
-//
-// It also holds the destination. Every file the archive offers has to land
-// under the module directory named after this module: an archive that reached
-// resources/views/home.kyse.go would land on a page the application wrote, and
-// what publishes the files writes what the archive says.
-func (m *Module) Boot(context.Context) error {
-	prefix := viewRoot + "/" + moduleDir + "/" + m.Name() + "/"
-	var stray []string
-	for _, path := range PublishedPaths() {
-		if !strings.HasPrefix(path, prefix) {
-			stray = append(stray, path)
-		}
+	// Generating is registered only when there is an engine to generate with: a
+	// route that always answered "not configured" would be a route that exists
+	// to be probed.
+	if m.cfg.Engine != nil {
+		r.Action(stdhttp.MethodPost, m.cfg.Prefix, m.store).Name("diffusion.store")
 	}
-	if len(stray) > 0 {
-		return fmt.Errorf("diffusion: %s would be published outside %s, where it lands on a file the application wrote",
-			strings.Join(stray, ", "), prefix)
-	}
-
-	registered := make(map[string]bool)
-	for _, name := range view.Registered() {
-		registered[name] = true
-	}
-	var missing []string
-	for _, name := range ViewNames() {
-		if !registered[name] {
-			missing = append(missing, name)
-		}
-	}
-	if len(missing) > 0 {
-		// The compiled packages are named because the import is the half of the
-		// install nothing else can do: the command writes the sources, the view
-		// compiler turns them into Go, and a package the application does not
-		// import is not linked at all.
-		imports := make([]string, 0, len(ViewPackages()))
-		for _, pkg := range ViewPackages() {
-			imports = append(imports, "<module path>/"+pkg)
-		}
-		return fmt.Errorf("diffusion: no view is registered as %s. Run `%s`, then `aru view:build`, then import %s in bootstrap/app.go",
-			strings.Join(missing, ", "), PublishCommand, strings.Join(imports, ", "))
-	}
-	return nil
 }
 
 // Handlers are thin on purpose: read the input, ask the service, answer. No
@@ -198,7 +177,16 @@ func (m *Module) Boot(context.Context) error {
 // other error is one nobody expected, and it reaches the error page rather than
 // a 200 with an empty body.
 
-// index answers a page of records.
+// acting is the subject a request is decided about: the one RequireAuth admitted,
+// or the one the application's own Config.Subject builds from the request.
+func (m *Module) acting(r *stdhttp.Request, admitted security.Subject) (security.Subject, error) {
+	if m.cfg.Subject != nil {
+		return m.cfg.Subject(r)
+	}
+	return admitted, nil
+}
+
+// index answers a page of runs.
 func (m *Module) index(ctx *fhttp.Context) error {
 	query := data.Query{
 		Sort:   ctx.Query("sort"),
@@ -206,7 +194,11 @@ func (m *Module) index(ctx *fhttp.Context) error {
 		Limit:  m.cfg.PageSize,
 	}
 
-	who, _ := ctx.User()
+	admitted, _ := ctx.User()
+	who, err := m.acting(ctx.Request, admitted)
+	if err != nil {
+		return err
+	}
 	records, err := m.svc.List(ctx.Ctx(), who, query)
 	if err != nil {
 		return err
@@ -222,9 +214,13 @@ func (m *Module) index(ctx *fhttp.Context) error {
 	return ctx.JSON(stdhttp.StatusOK, collectionFromPointers(records, cursor))
 }
 
-// show answers one record.
+// show answers one run.
 func (m *Module) show(ctx *fhttp.Context) error {
-	who, _ := ctx.User()
+	admitted, _ := ctx.User()
+	who, err := m.acting(ctx.Request, admitted)
+	if err != nil {
+		return err
+	}
 	record, err := m.svc.Find(ctx.Ctx(), who, ctx.Param("id"))
 	if err != nil {
 		return err
@@ -232,16 +228,94 @@ func (m *Module) show(ctx *fhttp.Context) error {
 	return ctx.JSON(stdhttp.StatusOK, resourceFromPointer(record))
 }
 
-// store creates one record.
+// store generates one picture from a prompt and answers it as image/png, with
+// the run's identifier and seed in headers so the client can look the run up
+// and repeat it.
+//
+// It takes text-to-image only. An image arriving over this route would be a
+// second place a file enters the application, beside the storage the
+// application already guards; img2img, inpainting and editing are Module.Generate,
+// called from the handler that read the image from there.
+//
+// The call holds the connection for as long as the model takes, which on a CPU
+// is minutes. An application that serves people puts the run on its queue and
+// calls Module.Generate from the worker; this route is for an operator and for
+// development.
 func (m *Module) store(ctx *fhttp.Context) error {
-	in := CreateRequest{Name: ctx.Input("name")}
-
-	who, _ := ctx.User()
-	record, err := m.svc.Create(ctx.Ctx(), who, in)
+	req, err := generateRequest(ctx)
 	if err != nil {
 		return err
 	}
-	return ctx.JSON(stdhttp.StatusCreated, resourceFromPointer(record))
+	admitted, _ := ctx.User()
+	who, err := m.acting(ctx.Request, admitted)
+	if err != nil {
+		return err
+	}
+	result, record, err := m.svc.Generate(ctx.Ctx(), who, req)
+	if err != nil {
+		return err
+	}
+	h := ctx.Response.Header()
+	h.Set("Content-Type", "image/png")
+	h.Set("Cache-Control", "private, no-store")
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("X-Diffusion-Run", record.ID)
+	h.Set("X-Diffusion-Seed", strconv.FormatInt(result.Seed, 10))
+	ctx.Response.WriteHeader(stdhttp.StatusCreated)
+	_, err = ctx.Response.Write(result.PNG)
+	return err
+}
+
+// generateRequest reads the text-to-image fields. A number that is not a number
+// is a rejected input, named by field, and never a default: a width the client
+// wrote and did not get is worse than one it was told about.
+func generateRequest(ctx *fhttp.Context) (Request, error) {
+	errs := validation.Errors{}
+	whole := func(name string) int {
+		v := ctx.Input(name)
+		if v == "" {
+			return 0
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			errs.Add(name, "must be a whole number")
+		}
+		return n
+	}
+	decimal := func(name string) float64 {
+		v := ctx.Input(name)
+		if v == "" {
+			return 0
+		}
+		n, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			errs.Add(name, "must be a number")
+		}
+		return n
+	}
+	req := Request{
+		Prompt:         ctx.Input("prompt"),
+		NegativePrompt: ctx.Input("negative_prompt"),
+		Width:          whole("width"),
+		Height:         whole("height"),
+		Steps:          whole("steps"),
+		CFG:            decimal("cfg"),
+		Sampler:        ctx.Input("sampler"),
+		Scheduler:      ctx.Input("scheduler"),
+		// An absent seed is a random one, which the response reports.
+		Seed: -1,
+	}
+	if v := ctx.Input("seed"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			errs.Add("seed", "must be a whole number")
+		}
+		req.Seed = n
+	}
+	if errs.Any() {
+		return Request{}, errs
+	}
+	return req, nil
 }
 
 // Migrations declares the schema this module owns.
@@ -264,7 +338,7 @@ type createDiffusions struct{ migrations.BaseMigration }
 // GetName is the migration's identity, and it carries the order. It is fixed
 // once the package is published: changing what an applied name means leaves the
 // change missing everywhere it already ran, and nothing says so.
-func (createDiffusions) GetName() string { return "20260823_0001_create_diffusions" }
+func (createDiffusions) GetName() string { return "20261120_0001_create_diffusions" }
 
 // Up creates the table and the index the keyset pagination scans.
 //
@@ -281,12 +355,43 @@ func (createDiffusions) Up(ctx context.Context, conn migrations.Connection) erro
 	return conn.Schema().Create(ctx, "diffusions", func(table *schema.Blueprint) {
 		table.String("id").Primary()
 		table.String("tenant_id")
-		table.String("name")
+		// Who asked, what for, how it ended.
+		table.String("user_id")
+		table.String("mode")
+		table.String("status")
+		table.String("error", 400)
+		// The prompt is stored only under Config.KeepPrompts; the digest always.
+		table.Text("prompt")
+		table.String("prompt_sha256")
+		// Which weights ran. These are columns and not a note because the
+		// question a run answers is what a model costs, and that is a
+		// comparison across them with everything else held equal.
+		table.String("model_name")
+		table.String("model_sha256")
+		table.String("quantization")
+		table.String("backend")
+		table.Integer("threads")
+		// The knobs, the seed being the one the engine used.
+		table.Integer("width")
+		table.Integer("height")
+		table.Integer("steps")
+		table.BigInteger("seed")
+		table.String("sampler")
+		table.Float("cfg")
+		// What it cost.
+		table.BigInteger("duration_ms")
+		table.BigInteger("sampling_ms")
+		table.BigInteger("peak_rss_bytes")
 		table.Timestamp("created_at")
 
 		// The index matches the ORDER BY of the listing, tenant first. Without
 		// it every page is a scan of every customer's rows.
 		table.Index([]string{"tenant_id", "created_at", "id"}, "diffusions_tenant_created_idx")
+
+		// The question asked of this table is almost always "how did the cost
+		// move as the model, the quantization or the backend changed". Without
+		// this index that is a scan.
+		table.Index([]string{"tenant_id", "model_sha256", "created_at"}, "diffusions_tenant_model_idx")
 	})
 }
 

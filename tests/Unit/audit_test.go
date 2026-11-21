@@ -183,8 +183,11 @@ func TestEveryServiceMethodAuthorizesBeforeTheModel(t *testing.T) {
 // calls a promoted write terminal. Diffusions itself counts: moving only its
 // construction before Authorize is the mutation this audit exists to reject.
 func firstModelReach(body *ast.BlockStmt) token.Pos {
+	// save is the service's own unexported write: it takes the Grant Authorize
+	// issued and stores a run, so a call to it is the data boundary of Generate
+	// and Record the way a call to Save is of a method that writes directly.
 	terminals := map[string]bool{
-		"Save": true, "Delete": true, "Restore": true, "Touch": true,
+		"Save": true, "Delete": true, "Restore": true, "Touch": true, "save": true,
 	}
 	found := token.NoPos
 	ast.Inspect(body, func(node ast.Node) bool {

@@ -10,11 +10,17 @@ framework = ">= 0.71"
 profiles = ["conventional", "performance"]
 
 [permissions]
-# It answers requests and reads its own rows. Nothing leaves the process.
+# Generation runs inside the process, on the application's own hardware. Nothing
+# leaves it by the network: no prompt, no image, no telemetry.
 network = false
-# It keeps no state outside the database.
-filesystem = false
-# It runs no other program.
+# It reads the model files named in ModelSet -- weights, encoders, VAE, LoRAs --
+# to digest them and, through the library, to load them. It writes no file: the
+# picture is returned as bytes and the application stores it.
+filesystem = true
+# It runs no other program. It does link one library, stable-diffusion.cpp,
+# through cgo and only under the `sdcpp` build tag. That is not exec and the
+# manifest has no key for it, so it is said here instead: an application that
+# builds with the tag needs CGO_ENABLED=1 and the archives from `make archives`.
 exec = false
 # module.go owns the diffusions table, so whoever installs this has to run
 # `aru migrate`. Declaring it is how they find that out before deploying.

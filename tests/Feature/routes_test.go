@@ -133,13 +133,17 @@ var everyRoute = []struct {
 }{
 	{http.MethodGet, diffusion.DefaultPrefix, ""},
 	{http.MethodGet, diffusion.DefaultPrefix + "/record-1", ""},
-	{http.MethodPost, diffusion.DefaultPrefix, "name=one"},
+	{http.MethodPost, diffusion.DefaultPrefix, "prompt=a+lighthouse"},
 }
+
+// generating is the configuration that registers the generating route: it needs
+// an engine, and the fake is the one that needs no model.
+func generating() diffusion.Config { return diffusion.Config{Engine: diffusion.NewFake()} }
 
 func TestAVisitorWithNoSessionIsSentToSignIn(t *testing.T) {
 	t.Parallel()
 
-	m := mount(t, diffusion.Config{})
+	m := mount(t, generating())
 
 	// RequireAuth answers before the handler runs, so a visitor with no
 	// session reaches neither the policy nor the database: the answer is the
@@ -157,7 +161,7 @@ func TestAVisitorWithNoSessionIsSentToSignIn(t *testing.T) {
 func TestASignedInSubjectReachesThePolicyAndIsRefused(t *testing.T) {
 	t.Parallel()
 
-	m := mount(t, diffusion.Config{})
+	m := mount(t, generating())
 	cookies := m.signIn(t, administrator())
 
 	// The guard admits the session and puts its subject on the request; the
@@ -176,16 +180,16 @@ func TestASignedInSubjectReachesThePolicyAndIsRefused(t *testing.T) {
 func TestARejectedInputGoesBackBeforeTheDatabase(t *testing.T) {
 	t.Parallel()
 
-	m := mount(t, diffusion.Config{})
+	m := mount(t, generating())
 	cookies := m.signIn(t, administrator())
 
 	// The input is validated before anything is authorized, so this refusal
 	// comes from the request and not from the policy. The router answers it the
 	// way it answers every rejected form: back where it came from, with the
 	// messages in the flash -- and it still never reaches a statement.
-	rec := m.answer(t, http.MethodPost, diffusion.DefaultPrefix, "name=", cookies...)
+	rec := m.answer(t, http.MethodPost, diffusion.DefaultPrefix, "prompt=a+lighthouse&steps=many", cookies...)
 	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/" {
-		t.Fatalf("an empty name answered %d to %q, want %d back to /", rec.Code, rec.Header().Get("Location"), http.StatusSeeOther)
+		t.Fatalf("a steps that is not a number answered %d to %q, want %d back to /", rec.Code, rec.Header().Get("Location"), http.StatusSeeOther)
 	}
 
 	// The page the redirect lands on is a navigation, which is the only read the
@@ -196,8 +200,15 @@ func TestARejectedInputGoesBackBeforeTheDatabase(t *testing.T) {
 		next.AddCookie(cookie)
 	}
 	errs, _, ok := m.flash.Take(httptest.NewRecorder(), next)
-	if !ok || len(errs["name"]) == 0 {
-		t.Fatalf("the redirect carries no message for name in the flash: %v", errs)
+	if !ok || len(errs["steps"]) == 0 {
+		t.Fatalf("the redirect carries no message for steps in the flash: %v", errs)
+	}
+
+	// A request the engine would refuse is turned into the same answer before a
+	// byte of the model is touched: a width that is not a multiple of eight.
+	rec = m.answer(t, http.MethodPost, diffusion.DefaultPrefix, "prompt=a+lighthouse&width=100", cookies...)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("a width of 100 answered %d, want %d back to the form", rec.Code, http.StatusSeeOther)
 	}
 }
 
@@ -221,7 +232,7 @@ func TestTheRouterAnswersAMissingRecordWith404(t *testing.T) {
 func TestTheModuleRegistersItsRoutesUnderItsPrefix(t *testing.T) {
 	t.Parallel()
 
-	m := mount(t, diffusion.Config{Prefix: "/widgets"})
+	m := mount(t, diffusion.Config{Prefix: "/widgets", Engine: diffusion.NewFake()})
 
 	got := make([]string, 0, 3)
 	for _, route := range m.router.Routes() {
@@ -243,6 +254,25 @@ func TestTheModuleRegistersItsRoutesUnderItsPrefix(t *testing.T) {
 	}
 }
 
+// TestWithoutAnEngineThereIsNoGeneratingRoute holds that a route that could only
+// answer "not configured" is not registered at all: the module then keeps and
+// lists runs, and nothing on its surface spends compute.
+func TestWithoutAnEngineThereIsNoGeneratingRoute(t *testing.T) {
+	t.Parallel()
+
+	m := mount(t, diffusion.Config{})
+	for _, route := range m.router.Routes() {
+		if route.Method == http.MethodPost {
+			t.Errorf("%s %s is registered with no engine configured", route.Method, route.Pattern)
+		}
+	}
+	cookies := m.signIn(t, administrator())
+	rec := m.answer(t, http.MethodPost, diffusion.DefaultPrefix, "prompt=a+lighthouse", cookies...)
+	if rec.Code != http.StatusMethodNotAllowed && rec.Code != http.StatusNotFound {
+		t.Fatalf("POST with no engine answered %d, want 405 or 404", rec.Code)
+	}
+}
+
 // TestNoRouteLandsInTheFrameworkNamespace is the one property of this package
 // that syntax cannot hold, and it is why it is checked here rather than beside
 // the other four in tests/Unit/audit_test.go: a prefix arrives through
@@ -257,7 +287,7 @@ func TestNoRouteLandsInTheFrameworkNamespace(t *testing.T) {
 
 	for _, cfg := range []diffusion.Config{
 		{},
-		{Prefix: "/widgets"},
+		{Prefix: "/widgets", Engine: diffusion.NewFake()},
 	} {
 		m := mount(t, cfg)
 

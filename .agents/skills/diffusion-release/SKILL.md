@@ -49,14 +49,23 @@ edited by hand. It needs the `aru` binary rather than the Go toolchain alone,
 which is why it sits beside the four gates and not among them.
 
 CI runs the same four, and so does the release workflow on the tagged archive.
-Both also run `go vet configure.go` by name while their template sections are
-still in them, because the build tag on that file keeps it out of `./...`.
+CI also runs a **native** job: it builds the CPU archives from the pinned
+submodule, runs `make check-headers`, and runs `go test -tags sdcpp ./...`, where
+`tests/Real` skips itself unless a model is present. A clean checkout fails to
+**link** without archives and that is expected; `go vet ./...` and
+`go vet -tags sdcpp ./...` are what must pass there.
 
-The template has two build subjects, and both are release gates: the raw clone
-and a clean copy after `configure.go` substitutes every name. Run build, vet,
-and race on both. Preserve a built configurator long enough to invoke it again
-inside the configured copy; it must refuse and the tree hash must be identical
-before and after that refusal.
+Verify a **configured copy** of the tree, not your working tree: a warm checkout
+hides an uncommitted file, a stale `go.sum` and a missing gitlink.
+
+```sh
+git worktree add --detach "$TMPDIR/check" HEAD
+GOWORK=off go -C "$TMPDIR/check" vet ./... && GOWORK=off go -C "$TMPDIR/check" test ./...
+```
+
+The real-model test is run locally before a tag, with a model under
+`~/.cache/hyzis-dev/ferflow/models/` (see `diffusion-engine`), and its command and
+result are recorded with the release.
 
 ## What the manifest declares, and who reads it
 
@@ -72,10 +81,14 @@ profiles = ["conventional", "performance"]
 
 [permissions]
 network = false
-filesystem = false
+filesystem = true
 exec = false
 migrations = true
 ```
+
+`filesystem = true` because the engine reads the model files; it writes none. The
+library is linked, not run, so `exec` stays false -- and says so in a comment,
+since the manifest has no key for cgo.
 
 `TestTheDeclaredCapabilitiesAreWhatTheCodeDoes`, in `tests/Unit/audit_test.go`,
 compares the four permissions against what the code *calls*, by AST —
@@ -130,6 +143,8 @@ Before tagging:
 
 - the four gates pass with `GOWORK=off`;
 - `aru model:build --check` finds nothing to change;
+- `make check-headers` finds the mirrored header equal to the submodule's;
+- the real-model test passed locally under `-tags sdcpp`;
 - `arandu.mod.toml` matches the code;
 - `CHANGELOG.md` has the entry, under the version, in the Keep a Changelog
   sections — `Added`, `Changed`, `Fixed`, `Removed`.

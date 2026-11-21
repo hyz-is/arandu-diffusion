@@ -7,7 +7,18 @@ import (
 	"github.com/arandu-io/hesape/database/model"
 )
 
-// Diffusion is the entity this package owns.
+// Diffusion is the entity this package owns: one run of the engine, kept.
+//
+// A run is what this package exists to measure. How long a model takes, how much
+// memory it holds and which exact weights produced a picture are answers an
+// application needs later, per tenant and per person, and a run that keeps its
+// numbers in a variable has nothing to put beside the next one.
+//
+// The row is append-only. It records who asked, what for, with which model and
+// what it cost; it never holds the picture, which the application stores where
+// it stores its files, and it holds the prompt only when the application opted
+// in with Config.KeepPrompts, because a prompt is often something a person
+// wrote about themselves.
 //
 // It embeds the model, so a row returned by a query carries the connection and
 // can be saved again. Build a new row with Diffusions(db).New(): a struct
@@ -28,12 +39,69 @@ type Diffusion struct {
 	// tenant.
 	TenantID string `db:"tenant_id"`
 
-	// Name is what a person calls this record.
-	Name string `db:"name"`
+	// UserID is who asked: the identifier of the subject that held the Grant.
+	UserID string `db:"user_id"`
+
+	// Mode is what the run did: txt2img, img2img, inpaint or edit.
+	Mode string `db:"mode"`
+
+	// Status is how it ended: ok, failed or cancelled.
+	Status string `db:"status"`
+
+	// Error is a short reason for a failed run. It is the engine's sentence
+	// with the prompt struck out, cut to ErrorMaxLen; empty when the run
+	// succeeded.
+	Error string `db:"error"`
+
+	// Prompt is what was asked, kept only under Config.KeepPrompts. PromptSHA256
+	// is always kept, so two runs of the same prompt can be matched without the
+	// text being stored.
+	Prompt       string `db:"prompt"`
+	PromptSHA256 string `db:"prompt_sha256"`
+
+	// ModelName, ModelSHA256 and Quantization say which weights ran: the label of
+	// the set, the digest of its primary file and the dominant weight type of
+	// that file, such as Q8_0. They are columns and not a note because the
+	// question a run answers is "what did this model cost", and that is a
+	// comparison across them with everything else held equal.
+	ModelName    string `db:"model_name"`
+	ModelSHA256  string `db:"model_sha256"`
+	Quantization string `db:"quantization"`
+
+	// Backend and Threads are where it ran: cpu, metal, cuda or vulkan, and how
+	// many CPU threads the engine was loaded with.
+	Backend string `db:"backend"`
+	Threads int    `db:"threads"`
+
+	// Width, Height, Steps, Seed, Sampler and CFG are the knobs of the run, the
+	// seed being the one the engine used, so the run can be repeated.
+	Width   int     `db:"width"`
+	Height  int     `db:"height"`
+	Steps   int     `db:"steps"`
+	Seed    int64   `db:"seed"`
+	Sampler string  `db:"sampler"`
+	CFG     float64 `db:"cfg"`
+
+	// DurationMS is the wall time of the call and SamplingMS the part inside the
+	// library. PeakRSSBytes is the process high-water mark when it finished; see
+	// Metrics.PeakRSSBytes for what that does and does not isolate.
+	DurationMS   int64 `db:"duration_ms"`
+	SamplingMS   int64 `db:"sampling_ms"`
+	PeakRSSBytes int64 `db:"peak_rss_bytes"`
 
 	// CreatedAt is when the row was written, in UTC.
 	CreatedAt time.Time `db:"created_at"`
 }
+
+// The values Status takes.
+const (
+	StatusOK        = "ok"
+	StatusFailed    = "failed"
+	StatusCancelled = "cancelled"
+)
+
+// ErrorMaxLen bounds Diffusion.Error.
+const ErrorMaxLen = 300
 
 // diffusionTable is the table Diffusion is a row of, declared once. Its query,
 // Diffusions, is generated beside it and is the one way to reach the rows.
@@ -82,35 +150,54 @@ var ErrNotFound = fmt.Errorf("diffusion: record not found: %w", model.ErrModelNo
 // A declared list rather than the entity itself. An encoder handed the entity
 // answers with whatever fields it happens to have, including the ones somebody
 // adds later without ever opening the handler -- and TenantID is exactly such a
-// field: it names another customer's identifier and belongs in no response.
+// field: it names another customer's identifier and belongs in no response. The
+// prompt is another: it leaves only through the one route that serves the run to
+// the person who made it, and that route is the application's to add.
 type Resource struct {
-	id        string
-	name      string
-	createdAt time.Time
+	record Diffusion
 }
 
 // NewResource snapshots one record for the response.
 func NewResource(record Diffusion) Resource {
-	return newResource(record.ID, record.Name, record.CreatedAt)
+	// Only the plain fields are copied: the embedded model carries a connection,
+	// and a snapshot that kept it would keep the database alive behind a response.
+	record.Model = model.Model{}
+	return Resource{record: record}
 }
 
 func resourceFromPointer(record *Diffusion) Resource {
 	if record == nil {
 		return Resource{}
 	}
-	return newResource(record.ID, record.Name, record.CreatedAt)
-}
-
-func newResource(id, name string, createdAt time.Time) Resource {
-	return Resource{id: id, name: name, createdAt: createdAt}
+	return NewResource(*record)
 }
 
 // ToArray returns the fields that may leave, by name.
 func (r Resource) ToArray() map[string]any {
+	d := r.record
 	return map[string]any{
-		"id":         r.id,
-		"name":       r.name,
-		"created_at": r.createdAt.UTC().Format(time.RFC3339),
+		"id":             d.ID,
+		"user_id":        d.UserID,
+		"mode":           d.Mode,
+		"status":         d.Status,
+		"error":          d.Error,
+		"prompt":         d.Prompt,
+		"prompt_sha256":  d.PromptSHA256,
+		"model":          d.ModelName,
+		"model_sha256":   d.ModelSHA256,
+		"quantization":   d.Quantization,
+		"backend":        d.Backend,
+		"threads":        d.Threads,
+		"width":          d.Width,
+		"height":         d.Height,
+		"steps":          d.Steps,
+		"seed":           d.Seed,
+		"sampler":        d.Sampler,
+		"cfg":            d.CFG,
+		"duration_ms":    d.DurationMS,
+		"sampling_ms":    d.SamplingMS,
+		"peak_rss_bytes": d.PeakRSSBytes,
+		"created_at":     d.CreatedAt.UTC().Format(time.RFC3339),
 	}
 }
 

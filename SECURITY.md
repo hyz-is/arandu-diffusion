@@ -36,10 +36,21 @@ particular:
 - a query whose tenant scope is disabled, or a tenant taken from anywhere but
   `data.Tenant(g)`;
 - a `Grant` that can be produced without a policy returning nil;
-- a field reaching a response that `Resource` does not list.
+- a field reaching a response that `Resource` does not list;
+- a path from a request to the file system: a `Request` names no file, and the
+  model paths are configuration;
+- a prompt reaching a log line, an error or a column when `Config.KeepPrompts` is
+  off;
+- an image that makes the engine allocate or loop without bound -- every image is
+  size-checked from its header before it is decoded;
+- a heap or stack fault in the cgo boundary reachable from a request.
 
 ## What is not
 
 - A vulnerability in the framework itself. Report that to the framework.
+- A vulnerability in stable-diffusion.cpp or ggml themselves, or in a model file:
+  report it to that project. A model file is code-adjacent input the application
+  chose to load; this package digests what it loads so a run can be attributed,
+  and does not vouch for the weights.
 - A policy that is too permissive in an application that opened it. What this
   package ships denies everything; what an application opens is its own.

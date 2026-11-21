@@ -1,6 +1,6 @@
 ---
 name: diffusion-package
-description: Install, wire and use the Diffusion package (Go, Arandu) in an application. Use when the request is to "install Diffusion", "add diffusion to the app", "go get github.com/hyz-is/arandu-diffusion", "wire it into bootstrap/app.go", "register the module", "use the diffusion routes", "everything under /diffusion returns 403", "403 forbidden from diffusion", "it redirects to /auth/login", "the table does not exist", "no such table", "change where it is mounted", "let admins read it", or when a project's go.mod already requires github.com/hyz-is/arandu-diffusion. Covers the wiring and where each part goes, publishing and linking the views, the Config fields, none of them required, the routes, their names and the session they need, why the policy refuses everything until somebody opens it, and the migration step that is not optional.
+description: Install, wire and use the Diffusion package (Go, Arandu) in an application -- image generation and editing with stable-diffusion.cpp in-process. Use when the request is to "install diffusion", "add image generation to the app", "go get github.com/hyz-is/arandu-diffusion", "wire it into bootstrap/app.go", "register the module", "generate an image", "inpaint", "edit with a reference image", "build with -tags sdcpp", "library stable-diffusion not found", "everything under /diffusion returns 403", "it redirects to /auth/login", "the table does not exist", or when a project's go.mod already requires github.com/hyz-is/arandu-diffusion. Covers the wiring, the build tag and archives, loading a model set, the request, the migration step, and why the policy refuses everything until the application opens it.
 license: MIT
 metadata:
   audience: app
@@ -8,23 +8,34 @@ metadata:
 
 # Using Diffusion
 
-An Arandu package with one entity, its own table, its own routes and its own
-policy. It is registered by hand — there is no service provider, no container
-and no discovery, so if a line is not written in the application, it does not
-happen.
+An Arandu package that is an image engine and a module: it links
+stable-diffusion.cpp through cgo so the model runs in your process, and it keeps
+what each run cost in its own table, behind its own routes and policy. It is
+registered by hand -- there is no service provider, no container and no
+discovery, so if a line is not written in the application, it does not happen.
 
 ## Install
 
 ```bash
-go get github.com/hyz-is/arandu-diffusion
+go get github.com/hyz-is/arandu-diffusion@<latest tag>   # gh release list -R hyz-is/arandu-diffusion
 ```
+
+Without a build tag the package compiles anywhere, and `Load` answers
+`ErrBackendUnavailable`; `Fake` works. To run a model, build with `-tags sdcpp`:
+
+```bash
+git clone --recurse-submodules --shallow-submodules https://github.com/hyz-is/arandu-diffusion
+make -C arandu-diffusion archives                      # BACKEND=cpu|metal|cuda|vulkan
+CGO_ENABLED=1 CGO_LDFLAGS="-L$PWD/arandu-diffusion/lib" go build -tags sdcpp ./...
+```
+
+A GPU backend adds a tag: `-tags "sdcpp sd_cuda"`. Do not link this and
+arandu-llama into one binary (two copies of ggml): run diffusion in its own
+worker.
 
 ## The wiring, and where each part goes
 
-All of it is in `bootstrap/app.go`. `aru make:module` does not edit this file for
-you, and the views the package carries have to be published and linked, below.
-
-The import, with the other module imports:
+All of it is in `bootstrap/app.go`. The import, with the other module imports:
 
 ```go
 import (
@@ -32,20 +43,32 @@ import (
 )
 ```
 
-The construction, in `App`, once `NewAppServiceProvider` has returned. `New`
-refuses a wiring that cannot work and `Configure` has no way to return that
-error, so the module is built where the error can leave. The database and the
-session store are the ones the framework built from the configuration:
+The engine is loaded once, where the application can fail at boot, and closed at
+shutdown by whoever opened it. Paths come from configuration, never from a request:
 
 ```go
-	diffusionModule, err := diffusion.New(diffusion.Config{}, drivers.DB, drivers.Sessions)
+	engine, err := diffusion.Load(diffusion.ModelSet{
+		Diffusion: cfg.Diffusion.Model, // FLUX.2 klein Q8_0 GGUF
+		VAE:       cfg.Diffusion.VAE,
+		LLM:       cfg.Diffusion.TextEncoder,
+	}, diffusion.WithThreads(cfg.Diffusion.Threads))
+```
+
+The module, in `App`, once `NewAppServiceProvider` has returned. `New` refuses a
+wiring that cannot work, so it is built where the error can leave:
+
+```go
+	diffusionModule, err := diffusion.New(diffusion.Config{
+		Engine: engine,
+		Policy: DiffusionRules{}, // your rules; see below
+	}, drivers.DB, drivers.Sessions)
 	if err != nil {
 		_ = drivers.Close()
 		return nil, err
 	}
 ```
 
-And the registration, in the `WithProviders(...)` chain the builder is made of:
+And the registration, in the `WithProviders(...)` chain:
 
 ```go
 	return Configure(cfg, drivers, app).
@@ -54,68 +77,35 @@ And the registration, in the `WithProviders(...)` chain the builder is made of:
 		Create()
 ```
 
-`New` returns an error rather than starting half-wired. It refuses a
-configuration that cannot work, a nil database handle and a nil session store,
-so a wiring mistake costs one restart instead of arriving as a nil dereference
-on the first request that needed it.
+Then, once, before the application serves, `aru migrate` (the package owns the
+`diffusions` table; `arandu.mod.toml` says `migrations = true`). Never at boot.
 
-## Then publish and link the views
-
-The package carries the markup of its own pages and hands it over, and it
-refuses to boot until the project has linked it. Publish them, then compile them:
-
-```bash
-aru vendor:publish --tag=view
-aru vendor:publish --tag=view --apply
-aru view:build
-```
-
-The first line only previews; nothing is written without `--apply`. The files
-land under `resources/views/modules/diffusion/` and are the project's from
-then on. `aru view:build` compiles them, and the compiled package is imported
-with the other blank imports of `bootstrap/app.go`:
+## Generate
 
 ```go
-	_ "your/module/path/storage/framework/views/modules/diffusion"
+res, run, err := diffusionModule.Generate(ctx, subject, diffusion.Request{
+	Prompt: "a lighthouse at dusk", Width: 512, Height: 512, Seed: -1, Steps: 20,
+})
+// res.PNG, res.Seed (the one to repeat it), res.Metrics; run is the kept row.
 ```
 
-**Symptom to recognise:** the application stops at boot with an error naming the
-view, the command and the import. One of the steps is missing, and the import
-is the usual one.
+Inpaint: `Init` (PNG/JPEG, sides multiples of 8) plus `Mask` (white repaints,
+black keeps; `diffusion.EncodeMaskPNG` builds a rectangle). **The masked pixels
+come back identical**, and the guarantee is made in Go after the library. Edit
+with references: `References: [][]byte{...}` on a model that supports it
+(FLUX.2 klein, Kontext). The picture is returned as bytes: **store it in R2**, as
+every file of an Arandu application. A long run belongs on your queue; call
+`Generate` from the worker. `Record` keeps a run you made with the engine
+yourself. In tests pass `diffusion.NewFake()`.
 
-## Then run the migrations
+## The policy refuses everything until you open it
 
-```bash
-aru migrate
-```
-
-Not optional, and not automatic. The package owns a table, which is why its
-`arandu.mod.toml` declares `migrations = true` — that declaration is how an
-installer finds out before deploying rather than from the first request.
-
-`aru migrate` is a step in the pipeline and never a call at the start of the
-process: with N replicas, N migrations race each other.
-
-**Symptom to recognise:** `no such table`, or `relation does not exist`, from a
-route that authorized correctly. The migration has not run.
-
-## Configuration
-
-| field | required | meaning |
-| --- | --- | --- |
-| `Prefix` | no | where the routes are mounted. Defaults to `/diffusion` |
-| `PageSize` | no | how many records one page answers with. Defaults to 25, refused above 200 |
-
-`diffusion.Config{}` is a complete configuration. There is no tenant to pass:
-every route needs a session, and the tenant of every statement comes from
-`data.Tenant(g)`, off the Grant of whoever is signed in. Passing a value the
-request named — a path segment, a header, a subdomain read off the URL — is what
-`TestNoTenantIsReadOutOfTheRequest` fails on in the package. In an application
-the same mistake is `aru doctor`'s `tenant-from-request`; in a package nothing
-but the package's own suite looks.
-
-`PageSize` above 200 is an error from `New`, not a silent 200. A number somebody
-wrote and did not get is worse than a number somebody wrote and was told about.
+`DiffusionPolicy` has no branch that allows an action, so a correctly wired,
+correctly migrated package answers 403 on day one. The application opens actions
+with `Config.Policy` (it cannot edit the package): the rules, with the tenant
+comparison kept and the actions filled by arandu-permission, are in
+`diffusion-policy` and in the `Config.Policy` doc comment. Actions:
+`diffusion.view`, `diffusion.list`, `diffusion.create` (the one that spends compute).
 
 ## Routes
 
@@ -123,92 +113,27 @@ wrote and did not get is worse than a number somebody wrote and was told about.
 | --- | --- | --- |
 | `GET` | `/diffusion` | `diffusion.index` |
 | `GET` | `/diffusion/{id}` | `diffusion.show` |
-| `POST` | `/diffusion` | `diffusion.store` |
+| `POST` | `/diffusion` | `diffusion.store` (only with `Config.Engine`; text-to-image, answers `image/png`) |
 
-Every route sits behind `RequireAuth`, mounted by the package itself. A request
-with no session is sent to `/auth/login` — 303, or `YPY-Redirect` for a YPY
-request — and comes back to the address it asked for after signing in. That is
-the sign-in screen the starter kit publishes; an application without one sees
-a 404 there.
-
-**Symptom to recognise:** every route of the package redirects to
-`/auth/login`. Nobody is signed in on that request: the session cookie did not
-arrive, or the session store passed to `New` is not the one the application
-signs people in with.
-
-Build URLs from the names, never by writing the path a second time. `aru
-route:list` shows them grouped by module. Under a custom `Prefix` the paths move
-and the names do not.
-
-`GET /diffusion` answers `{"data": {"items": [...]}}`, and adds
-`"next_cursor"` beside `data` when a further page exists. Pass it back as
-`?cursor=`. A page shorter than `PageSize` is the last one and carries no
-cursor.
-
-`TenantID` is not in any response. That is deliberate: it names a customer's
-identifier and the response is a declared list of fields rather than the entity.
-
-## Every route refuses everybody, until you open the policy
-
-This is the state the package ships in, and it is not a bug to work around.
-`DiffusionPolicy` denies every action and has no branch that allows one:
-
-```
-403 Forbidden
-```
-
-is what a correctly installed, correctly migrated, correctly wired package
-answers to an administrator who is signed in, on day one.
-
-Opening an action means writing the rule that opens it, in the package's
-`policy.go`, inside the block that says so:
-
-```go
-	// arandu:begin custom
-	if a == DiffusionView && (s.ID == record.ID || s.HasRole("admin")) {
-		return nil
-	}
-	// arandu:end custom
-```
-
-What is not written there stays closed, including every action added later.
-There are five actions — `DiffusionView`, `DiffusionList`, `DiffusionCreate`,
-`DiffusionUpdate`, `DiffusionDelete` — and opening one opens exactly one.
-
-**Do not open it from the application.** There is no hook, no override and no
-config flag for the policy, and adding one would be a second place where
-authorization is decided. If the rules this application needs are not the rules
-the package ships, the change belongs in the package.
-
-## What the answers mean
+Every route sits behind `RequireAuth`: a request with no session is sent to
+`/auth/login` (303), and returns to the page it asked for after signing in.
+**Symptom:** every route redirects there -- nobody is signed in on that request,
+or the session store passed to `New` is not the one the application signs in with.
 
 | status | what happened |
 | --- | --- |
-| `303` to `/auth/login` | there is no session on the request |
+| `303` to `/auth/login` | no session |
 | `403` | the policy refused, or no rule allows the action yet |
-| `404` | no row with that id in this tenant |
-| `303` back to the page the request came from | the input was rejected; the messages and what was typed are in the flash |
-| `422` `application/problem+json` | the input was rejected and the request asked for JSON; the messages are in `errors`, keyed by field |
+| `404` | no run with that id in this tenant |
+| `303` back / `422` | the input was rejected, messages keyed by field |
 
-A request that asks for JSON (an `Accept` naming `application/json`, or an XHR
-that is not a YPY request) gets the 403 and the 404 as problem documents too. The
-sign-in redirect is the same for every client.
+## What a run keeps, and what it does not
 
-The package does not choose these: its handlers return what the service
-returned, and the framework's router answers it. A refusal carries no detail
-beyond the status and its standard sentence. Telling a client why a policy said
-no tells it what exists and what does not, one request at a time. The reason is
-in the log.
+Who, mode, status, model name and digest, quantization, backend, threads, size,
+steps, seed, sampler, cfg, durations and the process peak memory. Never the
+picture, and **not the prompt unless `Config.KeepPrompts`** (its digest is always
+kept). `TenantID` is in no response.
 
-Anything else is a 500 and the framework's error page in development. The
-package returns unexpected errors rather than swallowing them, so a route that
-answers 200 with an empty body is not something it does.
-
-## Reporting a problem
-
-Issues and pull requests go to the repository the module path names,
-`github.com/hyz-is/arandu-diffusion`, which belongs to `hyz-is`. A vulnerability goes to the
-private advisory form named in that repository's `SECURITY.md`, and never into
-an issue.
-
-MIT licensed. Copyright HYZIS.
+Issues and pull requests go to `github.com/hyz-is/arandu-diffusion`; a
+vulnerability goes to the private advisory form in `SECURITY.md`. MIT licensed.
+Copyright HYZIS.

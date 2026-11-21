@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/arandu-io/framework/security"
+	"github.com/arandu-io/hesape/auth"
 )
 
 // The actions of Diffusion. Constants rather than strings at the call site: a
@@ -14,16 +15,13 @@ import (
 // packages, and the name of an action shows up in logs and in audit trails
 // where "view" on its own says nothing about what was viewed.
 const (
-	// DiffusionView is reading one record.
+	// DiffusionView is reading one run.
 	DiffusionView security.Action = "diffusion.view"
-	// DiffusionList is paging through the records.
+	// DiffusionList is paging through the runs.
 	DiffusionList security.Action = "diffusion.list"
-	// DiffusionCreate is adding one.
+	// DiffusionCreate is running the engine and keeping the run, or keeping a run
+	// the application made itself. It is the action that spends compute.
 	DiffusionCreate security.Action = "diffusion.create"
-	// DiffusionUpdate is changing one.
-	DiffusionUpdate security.Action = "diffusion.update"
-	// DiffusionDelete is removing one.
-	DiffusionDelete security.Action = "diffusion.delete"
 )
 
 // DiffusionPolicy is the only authority over who does what with a Diffusion.
@@ -42,6 +40,19 @@ type DiffusionPolicy struct{}
 // policy that drifted onto another type would leave this one unguarded while
 // the Model path still compiled.
 var _ security.Policy[Diffusion] = DiffusionPolicy{}
+
+// Compile-time proof that the policy says which of its actions write.
+var _ auth.Writes = DiffusionPolicy{}
+
+// Writes reports whether a Grant issued for the action may write. DiffusionView
+// and DiffusionList read, so the Grant Authorize issues for either is refused by
+// every write -- the database, the cache, the outbox -- with auth.ErrReadGrant.
+//
+// The set is closed and written out: an action added later reads until it is
+// named here, so a Grant issued for it cannot write by accident. An application
+// that passes its own policy in Config.Policy answers Writes by calling this
+// method, so both policies agree on which actions write.
+func (DiffusionPolicy) Writes(a security.Action) bool { return a == DiffusionCreate }
 
 // Can decides whether the subject may perform the action on the record.
 //
