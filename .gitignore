@@ -31,3 +31,7 @@ Thumbs.db
 *~
 .idea/
 .vscode/
+
+# The archives `make archives` builds from the submodule, and its build tree.
+/lib/
+/build/
